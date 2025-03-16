@@ -642,7 +642,7 @@ async function downloadAndProcessMp3({
 
 const pLimit = require("p-limit").default;
 
-const limit = pLimit(2); // Limit to 2 concurrent downloads
+const limit = pLimit(1); // Limit to 2 concurrent downloads
 app.post("/batch-download-mp3", async (req, res) => {
   try {
     const { videos } = req.body;

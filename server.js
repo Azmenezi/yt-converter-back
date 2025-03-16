@@ -4,6 +4,7 @@ const cors = require("cors");
 const morgan = require("morgan");
 const fs = require("fs");
 const path = require("path");
+const archiver = require("archiver"); // <-- NEW
 
 const app = express();
 app.use(express.json());
@@ -39,50 +40,83 @@ app.post("/fetch-videos", (req, res) => {
   if (!channelUrl) {
     return res.status(400).json({ error: "Channel URL is required" });
   }
-  exec(`yt-dlp -j --flat-playlist "${channelUrl}"`, (error, stdout) => {
+
+  // If it's a single video, extract full metadata
+  const isSingleVideo = channelUrl.includes("watch?v=");
+  const ytCommand = isSingleVideo
+    ? `yt-dlp -j --no-playlist "${channelUrl}"`
+    : `yt-dlp -j --flat-playlist "${channelUrl}"`;
+
+  exec(ytCommand, (error, stdout) => {
     if (error) {
       console.log(error);
       return res.status(500).json({ error: "Failed to fetch videos" });
     }
     try {
-      const videos = stdout
+      let videos = stdout
         .trim()
         .split("\n")
-        .filter((line) => {
-          const video = JSON.parse(line);
-          return (
+        .map((line) => JSON.parse(line))
+        .filter(
+          (video) =>
             video.title !== "[Deleted video]" &&
             video.title !== "[Private video]"
-          );
-        })
-        .map((line) => {
-          const video = JSON.parse(line);
-          const folderName = video.playlist_title
-            ? sanitizeFilenameForWindows(video.playlist_title)
-            : video.uploader
-            ? sanitizeFilenameForWindows(video.uploader)
-            : "default";
-          // Build the filename as "<title>_<id>.mp3"
-          const originalFilename = `${video.title}_${video.id}.mp3`;
-          // Sanitize the filename and replace spaces with underscores.
-          const safeFilename = sanitizeFilenameForWindows(
-            originalFilename
-          ).replace(/ /g, "_");
-          return {
-            id: video.id,
-            title: video.title,
-            url: `https://www.youtube.com/watch?v=${video.id}`,
-            originalFilename: originalFilename.replace(/ /g, "_"),
-            safeFilename,
-            folderName: folderName.replace(/ /g, "_"),
-            thumbnail:
-              video.thumbnail ||
-              (video.thumbnails &&
-                video.thumbnails[0] &&
-                video.thumbnails[0].url) ||
-              "",
-          };
+        );
+
+      if (isSingleVideo) {
+        const video = videos[0]; // Get the single video
+        const folderName = sanitizeFilenameForWindows(
+          video.uploader || "SingleVideo"
+        );
+        const originalFilename = `${video.title}_${video.id}.mp3`;
+        const safeFilename = sanitizeFilenameForWindows(
+          originalFilename
+        ).replace(/ /g, "_");
+
+        return res.json({
+          videos: [
+            {
+              id: video.id,
+              title: video.title,
+              url: `https://www.youtube.com/watch?v=${video.id}`,
+              originalFilename: originalFilename.replace(/ /g, "_"),
+              safeFilename,
+              folderName: folderName.replace(/ /g, "_"),
+              thumbnail:
+                video.thumbnail ||
+                (video.thumbnails && video.thumbnails[0]?.url) ||
+                "",
+            },
+          ],
         });
+      }
+
+      videos = videos.map((video) => {
+        const folderName = video.playlist_title
+          ? sanitizeFilenameForWindows(video.playlist_title)
+          : video.uploader
+          ? sanitizeFilenameForWindows(video.uploader)
+          : "default";
+
+        const originalFilename = `${video.title}_${video.id}.mp3`;
+        const safeFilename = sanitizeFilenameForWindows(
+          originalFilename
+        ).replace(/ /g, "_");
+
+        return {
+          id: video.id,
+          title: video.title,
+          url: `https://www.youtube.com/watch?v=${video.id}`,
+          originalFilename: originalFilename.replace(/ /g, "_"),
+          safeFilename,
+          folderName: folderName.replace(/ /g, "_"),
+          thumbnail:
+            video.thumbnail ||
+            (video.thumbnails && video.thumbnails[0]?.url) ||
+            "",
+        };
+      });
+
       res.json({ videos });
     } catch (err) {
       res.status(500).json({ error: "Error parsing video data" });
@@ -376,7 +410,7 @@ app.post("/download-mp3", (req, res) => {
         //
         // We’ll build the actual ffmpeg command conditionally:
 
-        let timeFlags = `-t 45`; // default to 45s
+        let timeFlags = `-t 120`; // default to 45s
         let filterChain = `silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1,silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1`;
 
         // If user specified startTime & endTime:
@@ -432,6 +466,245 @@ app.post("/download-mp3", (req, res) => {
       }
     );
   });
+});
+
+app.post("/download-mp3-simple", (req, res) => {
+  const { videoUrl, originalFilename, safeFilename, folderName } = req.body;
+
+  if (!videoUrl || !originalFilename || !safeFilename || !folderName) {
+    return res.status(400).json({ error: "Missing required parameters" });
+  }
+
+  // Create directory, build paths
+  const safeOriginalFilename = sanitizeFilenameForWindows(
+    originalFilename
+  ).replace(/ /g, "_");
+  const subFolder = path.join(DOWNLOAD_FOLDER, folderName);
+  if (!fs.existsSync(subFolder)) {
+    fs.mkdirSync(subFolder, { recursive: true });
+  }
+  const safeFilePath = path.join(subFolder, safeFilename);
+  const finalFilePath = path.join(subFolder, safeOriginalFilename);
+
+  if (fs.existsSync(finalFilePath)) {
+    return res.json({ message: "Already downloaded", skipped: true });
+  }
+
+  // Download the MP3 using yt-dlp
+  const downloadCommand = `yt-dlp --restrict-filenames -x --audio-format mp3 -o "${safeFilePath}" ${videoUrl}`;
+  exec(downloadCommand, (downloadError, downloadStdout, downloadStderr) => {
+    if (downloadError) {
+      console.error("Download error:", downloadStderr);
+      return res.status(500).json({ error: "MP3 Download failed" });
+    }
+
+    // Compress the MP3 to 64k bitrate
+    const tempFilePath = finalFilePath.replace(".mp3", "_temp.mp3");
+
+    const compressionCommand = `
+      ffmpeg -i "${safeFilePath.replace(/\\/g, "/")}" 
+      -b:a 64k -c:a libmp3lame 
+      -y "${tempFilePath.replace(/\\/g, "/")}"
+    `.replace(/\s+/g, " ");
+
+    exec(compressionCommand, (ffmpegError, ffmpegStdout, ffmpegStderr) => {
+      if (ffmpegError) {
+        console.error("Compression error:", ffmpegStderr);
+        return res.status(500).json({ error: "MP3 Compression failed" });
+      }
+
+      try {
+        // Ensure temp file exists before renaming
+        if (!fs.existsSync(tempFilePath)) {
+          return res
+            .status(500)
+            .json({ error: "Compression failed: temp file missing" });
+        }
+
+        // Rename temp file to final filename
+        fs.renameSync(tempFilePath, finalFilePath);
+
+        // Only delete the original file if it's different from the final output
+        if (safeFilePath !== finalFilePath && fs.existsSync(safeFilePath)) {
+          fs.unlinkSync(safeFilePath);
+        }
+
+        const relativePath = path
+          .join(folderName, safeOriginalFilename)
+          .replace(/\\/g, "/");
+        return res.json({
+          message: "MP3 downloaded and compressed",
+          file: relativePath,
+          skipped: false,
+        });
+      } catch (cleanupErr) {
+        console.error("Cleanup error:", cleanupErr);
+        return res.status(500).json({ error: "Error finalizing MP3 file" });
+      }
+    });
+  });
+});
+async function downloadAndProcessMp3({
+  videoUrl,
+  originalFilename,
+  safeFilename,
+  folderName,
+  startTime,
+  endTime,
+}) {
+  return new Promise((resolve) => {
+    const safeOriginalFilename = sanitizeFilenameForWindows(
+      originalFilename
+    ).replace(/ /g, "_");
+    const subFolder = path.join(DOWNLOAD_FOLDER, folderName);
+    if (!fs.existsSync(subFolder)) {
+      fs.mkdirSync(subFolder, { recursive: true });
+    }
+    const safeFilePath = path.join(subFolder, safeFilename);
+    const finalFilePath = path.join(subFolder, safeOriginalFilename);
+
+    if (fs.existsSync(finalFilePath)) {
+      console.log(`Skipping ${safeOriginalFilename}, already downloaded.`);
+      return resolve(finalFilePath);
+    }
+
+    // Step A: Download
+    const downloadCommand = `yt-dlp --restrict-filenames -x --audio-format mp3 -o "${safeFilePath}" ${videoUrl}`;
+    exec(downloadCommand, (downloadError, downloadStdout, downloadStderr) => {
+      if (downloadError || downloadStderr.includes("Video unavailable")) {
+        console.warn(`Skipping ${safeOriginalFilename}: Video unavailable.`);
+        return resolve(null); // Instead of rejecting, we return null.
+      }
+
+      // Step B: Spleeter
+      const execOptions = {
+        env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+      };
+      const baseName = path.basename(safeFilePath, ".mp3");
+      const spleeterCommand = `py -3.10 -m spleeter separate -p spleeter:2stems -o "temp_output" "${safeFilePath}"`;
+
+      exec(
+        spleeterCommand,
+        execOptions,
+        (spleeterError, spleeterStdout, spleeterStderr) => {
+          if (spleeterError) {
+            console.warn(
+              `Skipping ${safeOriginalFilename}: Vocal separation failed.`
+            );
+            return resolve(null);
+          }
+
+          // Step C: FFmpeg chain
+          const vocalsPath = path.join("temp_output", baseName, "vocals.wav");
+          let timeFlags = `-t 90`;
+          let filterChain =
+            `silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1,` +
+            `silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1`;
+
+          const segmentSelected =
+            typeof startTime === "number" && typeof endTime === "number";
+          if (segmentSelected) {
+            timeFlags = `-ss ${startTime} -to ${endTime}`;
+          }
+
+          const ffmpegCommand = `
+            ffmpeg ${timeFlags} -i "${vocalsPath}" 
+            -af "${filterChain}" 
+            -c:a libmp3lame -b:a 64k 
+            -y "${finalFilePath}"
+          `.replace(/\s+/g, " ");
+
+          exec(ffmpegCommand, (ffmpegError, ffmpegStdout, ffmpegStderr) => {
+            if (ffmpegError) {
+              console.warn(
+                `Skipping ${safeOriginalFilename}: Audio processing failed.`
+              );
+              return resolve(null);
+            }
+
+            // Step D: Cleanup
+            try {
+              const spleeterOutDir = path.join("temp_output", baseName);
+              if (fs.existsSync(spleeterOutDir)) {
+                fs.rmSync(spleeterOutDir, { recursive: true, force: true });
+              }
+            } catch (cleanupErr) {
+              console.error("Cleanup error:", cleanupErr);
+            }
+
+            return resolve(finalFilePath);
+          });
+        }
+      );
+    });
+  });
+}
+
+const pLimit = require("p-limit").default;
+
+const limit = pLimit(2); // Limit to 2 concurrent downloads
+app.post("/batch-download-mp3", async (req, res) => {
+  try {
+    const { videos } = req.body;
+    if (!Array.isArray(videos) || videos.length === 0) {
+      return res.status(400).json({ error: "No videos provided" });
+    }
+
+    // Limit concurrent downloads to avoid overloading CPU
+    const downloadPromises = videos.map((vid) =>
+      limit(() => downloadAndProcessMp3(vid))
+    );
+
+    // Wait for all downloads, allowing some failures (null values)
+    let finalPaths = await Promise.all(downloadPromises);
+
+    // Remove failed downloads (null values)
+    finalPaths = finalPaths.filter((path) => path !== null);
+
+    // If all failed, return an error
+    if (finalPaths.length === 0) {
+      return res.status(500).json({ error: "No MP3s could be downloaded." });
+    }
+
+    // Proceed with zipping logic
+    const timestamp = Date.now();
+    const zipName = `batch_${timestamp}.zip`;
+    const zipSubfolder = path.join(DOWNLOAD_FOLDER, "tmp");
+    if (!fs.existsSync(zipSubfolder)) {
+      fs.mkdirSync(zipSubfolder, { recursive: true });
+    }
+    const zipPath = path.join(zipSubfolder, zipName);
+
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver("zip", { zlib: { level: 9 } });
+
+    archive.on("error", (err) => {
+      throw err;
+    });
+    archive.pipe(output);
+
+    // Add each successful MP3 to the ZIP
+    finalPaths.forEach((mp3Path) => {
+      if (fs.existsSync(mp3Path)) {
+        archive.file(mp3Path, { name: path.basename(mp3Path) });
+      }
+    });
+
+    await archive.finalize();
+
+    const relativeZip = path
+      .relative(DOWNLOAD_FOLDER, zipPath)
+      .replace(/\\/g, "/");
+
+    return res.json({
+      message: "Batch MP3s downloaded & zipped",
+      file: relativeZip,
+      skipped: true, // Indicate some files were skipped.
+    });
+  } catch (err) {
+    console.error("Batch download error:", err);
+    return res.status(500).json({ error: "Batch download failed" });
+  }
 });
 
 app.listen(5000, () => console.log("Server running on port 5000"));

@@ -378,6 +378,7 @@ app.post("/download-mp3", (req, res) => {
           `silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1`,
           `afftdn`,
           `acompressor`,
+          `volume=10dB`, // Increase volume by 3dB
           `aresample=96000`,
         ].join(",");
 

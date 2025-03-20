@@ -1,10 +1,11 @@
-const express = require("express");
-const { exec } = require("child_process");
-const cors = require("cors");
-const morgan = require("morgan");
-const fs = require("fs");
-const path = require("path");
-const archiver = require("archiver"); // <-- NEW
+import express from "express";
+import { exec } from "child_process";
+import cors from "cors";
+import morgan from "morgan";
+import fs from "fs";
+import path from "path";
+import archiver from "archiver";
+import pLimit from "p-limit"; // ✅ Now works!
 
 const app = express();
 app.use(express.json());
@@ -599,8 +600,6 @@ async function downloadAndProcessMp3({
   });
 }
 
-const pLimit = require("p-limit").default;
-
 const limit = pLimit(1); // Limit to 2 concurrent downloads
 app.post("/batch-download-mp3", async (req, res) => {
   try {
@@ -666,4 +665,4 @@ app.post("/batch-download-mp3", async (req, res) => {
   }
 });
 
-app.listen(5000, () => console.log("Server running on port 5000"));
+app.listen(8001, () => console.log("Server running on port 8001"));

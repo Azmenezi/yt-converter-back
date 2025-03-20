@@ -1,4 +1,8 @@
 {
+  "name": "your-app",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
   "dependencies": {
     "archiver": "^7.0.1",
     "better-queue": "^3.8.12",

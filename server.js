@@ -187,128 +187,6 @@ app.delete("/delete-file", (req, res) => {
   }
 });
 
-// app.post("/download-mp3", (req, res) => {
-//   const {
-//     videoUrl,
-//     originalFilename,
-//     safeFilename,
-//     folderName,
-//     startTime,
-//     endTime,
-//   } = req.body;
-
-//   if (!videoUrl || !originalFilename || !safeFilename || !folderName) {
-//     return res.status(400).json({ error: "Missing required parameters" });
-//   }
-
-//   // 1) Create directory, build paths, etc.
-//   const safeOriginalFilename = sanitizeFilenameForWindows(
-//     originalFilename
-//   ).replace(/ /g, "_");
-//   const subFolder = path.join(DOWNLOAD_FOLDER, folderName);
-//   if (!fs.existsSync(subFolder)) {
-//     fs.mkdirSync(subFolder, { recursive: true });
-//   }
-//   const safeFilePath = path.join(subFolder, safeFilename);
-//   const finalFilePath = path.join(subFolder, safeOriginalFilename);
-
-//   if (fs.existsSync(finalFilePath)) {
-//     return res.json({ message: "Already downloaded", skipped: true });
-//   }
-
-//   // 2) Download the MP3 (yt-dlp)
-//   const downloadCommand = `yt-dlp --restrict-filenames -x --audio-format mp3 -o "${safeFilePath}" ${videoUrl}`;
-//   exec(downloadCommand, (downloadError, downloadStdout, downloadStderr) => {
-//     if (downloadError) {
-//       console.error("Download error:", downloadStderr);
-//       return res.status(500).json({ error: "MP3 Download failed" });
-//     }
-
-//     // 3) Spleeter to separate vocals
-//     const execOptions = { env: { ...process.env, PYTHONIOENCODING: "utf-8" } };
-//     const baseName = path.basename(safeFilePath, ".mp3");
-//     const spleeterCommand = `py -3.10 -m spleeter separate -p spleeter:2stems -o "temp_output" "${safeFilePath}"`;
-
-//     exec(
-//       spleeterCommand,
-//       execOptions,
-//       (spleeterError, spleeterStdout, spleeterStderr) => {
-//         if (spleeterError) {
-//           console.error("Spleeter separation failed:", spleeterStderr);
-//           return res.json({
-//             message: "Downloaded but vocal separation failed",
-//             skipped: false,
-//           });
-//         }
-
-//         // Vocals output path from Spleeter:
-//         const vocalsPath = path.join("temp_output", baseName, "vocals.wav");
-
-//         // 4) Now do everything in ONE ffmpeg command:
-//         //    - First pass silence removal @ -50dB
-//         //    - Then (optionally) trim (ss/to or 45s)
-//         //    - Then final silence removal at 0 threshold
-//         //    - Compress to 64k MP3
-//         //
-//         // We’ll build the actual ffmpeg command conditionally:
-
-//         let timeFlags = `-t 120`; // default to 45s
-//         let filterChain = `silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1,silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1`;
-
-//         // If user specified startTime & endTime:
-//         const segmentSelected =
-//           typeof startTime === "number" && typeof endTime === "number";
-//         if (segmentSelected) {
-//           // Instead of limiting to 45s, we do -ss / -to:
-//           timeFlags = `-ss ${startTime} -to ${endTime}`;
-//         }
-
-//         // Construct final ffmpeg command:
-//         const ffmpegCommand = `
-//         ffmpeg ${timeFlags} -i "${vocalsPath}"
-//         -af "${filterChain}"
-//         -c:a libmp3lame -b:a 64k
-//         -y "${finalFilePath}"
-//       `.replace(/\s+/g, " "); // flatten out whitespace
-
-//         exec(ffmpegCommand, (ffmpegError, ffmpegStdout, ffmpegStderr) => {
-//           if (ffmpegError) {
-//             console.error("Final ffmpeg processing error:", ffmpegStderr);
-//             return res.status(500).json({ error: "Audio processing failed" });
-//           }
-
-//           // 5) Cleanup — remove Spleeter folder + rename or remove original MP3 if desired
-//           try {
-//             // Remove entire Spleeter output subdir
-//             if (fs.existsSync(path.join("temp_output", baseName))) {
-//               fs.rmdirSync(path.join("temp_output", baseName), {
-//                 recursive: true,
-//               });
-//             }
-//             // Optionally remove the original splitted MP3 if you don’t need it:
-//             // if (fs.existsSync(safeFilePath)) fs.unlinkSync(safeFilePath);
-
-//             // Build a relative path for the final file
-//             const relativePath = path
-//               .join(folderName, safeOriginalFilename)
-//               .replace(/\\/g, "/");
-
-//             return res.json({
-//               message: "MP3 downloaded, split, silence-removed, and trimmed",
-//               file: relativePath,
-//               skipped: false,
-//             });
-//           } catch (cleanupErr) {
-//             console.error("Error during cleanup:", cleanupErr);
-//             return res
-//               .status(500)
-//               .json({ error: "Error finalizing audio file" });
-//           }
-//         });
-//       }
-//     );
-//   });
-// });
 // Create a queue for processing downloads
 app.post("/download-mp3", (req, res) => {
   const {
@@ -347,38 +225,48 @@ app.post("/download-mp3", (req, res) => {
       return res.status(500).json({ error: "MP3 Download failed" });
     }
 
-    // Step 2: Run Spleeter to separate vocals from accompaniment
+    // Step 2: Run Demucs to separate vocals from accompaniment
     const execOptions = { env: { ...process.env, PYTHONIOENCODING: "utf-8" } };
     const baseName = path.basename(safeFilePath, ".mp3");
-    const spleeterCommand = `py -3.10 -m spleeter separate -p spleeter:2stems -o "temp_output" "${safeFilePath}"`;
+
+    // Example: Using Demucs 2-stem for vocals
+    const demucsCommand = `python demucs_wrapper.py --two-stems=vocals -o "temp_output" "${safeFilePath}"`;
 
     exec(
-      spleeterCommand,
+      demucsCommand,
       execOptions,
-      (spleeterError, spleeterStdout, spleeterStderr) => {
-        if (spleeterError) {
-          console.error("Spleeter separation failed:", spleeterStderr);
+      (demucsError, demucsStdout, demucsStderr) => {
+        if (demucsError) {
+          console.error("Demucs separation failed:", demucsStderr);
           return res.json({
             message: "Downloaded but vocal separation failed",
             skipped: false,
           });
         }
 
-        // Path to the isolated vocals output from Spleeter
-        const vocalsPath = path.join("temp_output", baseName, "vocals.wav");
+        // By default, Demucs will place the separated files under:
+        // temp_output/htdemucs/<baseName>/vocals.wav and no_vocals.wav
+        // Adjust as needed if you specify a different model
+        const vocalsPath = path.join(
+          "temp_output",
+          "htdemucs",
+          baseName,
+          "vocals.wav"
+        );
 
         // Build an enhanced filter chain:
         // 1. Silence removal (first pass)
         // 2. Silence removal (final pass)
         // 3. Noise reduction (afftdn)
         // 4. Dynamic range compression (acompressor)
-        // 5. Upsample to 96 kHz (aresample)
+        // 5. Increase volume +10dB
+        // 6. Upsample to 96 kHz (aresample)
         let filterChain = [
           `silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1`,
           `silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1`,
           `afftdn`,
           `acompressor`,
-          `volume=10dB`, // Increase volume by 3dB
+          `volume=10dB`,
           `aresample=96000`,
         ].join(",");
 
@@ -403,11 +291,11 @@ app.post("/download-mp3", (req, res) => {
             return res.status(500).json({ error: "Audio processing failed" });
           }
 
-          // Step 4: Cleanup – remove the Spleeter temporary folder
+          // Step 4: Cleanup – remove the Demucs temporary folder
           try {
-            const spleeterOutDir = path.join("temp_output", baseName);
-            if (fs.existsSync(spleeterOutDir)) {
-              fs.rmdirSync(spleeterOutDir, { recursive: true });
+            const demucsOutDir = path.join("temp_output", "htdemucs", baseName);
+            if (fs.existsSync(demucsOutDir)) {
+              fs.rmdirSync(demucsOutDir, { recursive: true });
             }
             const relativePath = path
               .join(folderName, safeOriginalFilename)
@@ -505,6 +393,8 @@ app.post("/download-mp3-simple", (req, res) => {
     });
   });
 });
+
+// Helper function for single MP3 download & process
 async function downloadAndProcessMp3({
   videoUrl,
   originalFilename,
@@ -537,71 +427,73 @@ async function downloadAndProcessMp3({
         return resolve(null); // Instead of rejecting, we return null.
       }
 
-      // Step B: Spleeter
+      // Step B: Demucs
       const execOptions = {
         env: { ...process.env, PYTHONIOENCODING: "utf-8" },
       };
       const baseName = path.basename(safeFilePath, ".mp3");
-      const spleeterCommand = `py -3.10 -m spleeter separate -p spleeter:2stems -o "temp_output" "${safeFilePath}"`;
+      const demucsCommand = `python demucs_wrapper.py --two-stems=vocals -o "temp_output" "${safeFilePath}"`;
 
-      exec(
-        spleeterCommand,
-        execOptions,
-        (spleeterError, spleeterStdout, spleeterStderr) => {
-          if (spleeterError) {
+      exec(demucsCommand, execOptions, (demucsError) => {
+        if (demucsError) {
+          console.warn(
+            `Skipping ${safeOriginalFilename}: Vocal separation failed.`
+          );
+          return resolve(null);
+        }
+
+        // Step C: FFmpeg chain (using vocals.wav from Demucs)
+        const vocalsPath = path.join(
+          "temp_output",
+          "htdemucs",
+          baseName,
+          "vocals.wav"
+        );
+
+        let timeFlags = `-t 90`;
+        let filterChain =
+          `silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1,` +
+          `silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1`;
+
+        const segmentSelected =
+          typeof startTime === "number" && typeof endTime === "number";
+        if (segmentSelected) {
+          timeFlags = `-ss ${startTime} -to ${endTime}`;
+        }
+
+        const ffmpegCommand = `
+          ffmpeg ${timeFlags} -i "${vocalsPath}" 
+          -af "${filterChain}" 
+          -c:a libmp3lame -b:a 64k 
+          -y "${finalFilePath}"
+        `.replace(/\s+/g, " ");
+
+        exec(ffmpegCommand, (ffmpegError) => {
+          if (ffmpegError) {
             console.warn(
-              `Skipping ${safeOriginalFilename}: Vocal separation failed.`
+              `Skipping ${safeOriginalFilename}: Audio processing failed.`
             );
             return resolve(null);
           }
 
-          // Step C: FFmpeg chain
-          const vocalsPath = path.join("temp_output", baseName, "vocals.wav");
-          let timeFlags = `-t 90`;
-          let filterChain =
-            `silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1,` +
-            `silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1`;
-
-          const segmentSelected =
-            typeof startTime === "number" && typeof endTime === "number";
-          if (segmentSelected) {
-            timeFlags = `-ss ${startTime} -to ${endTime}`;
+          // Step D: Cleanup
+          try {
+            const demucsOutDir = path.join("temp_output", "htdemucs", baseName);
+            if (fs.existsSync(demucsOutDir)) {
+              fs.rmSync(demucsOutDir, { recursive: true, force: true });
+            }
+          } catch (cleanupErr) {
+            console.error("Cleanup error:", cleanupErr);
           }
 
-          const ffmpegCommand = `
-            ffmpeg ${timeFlags} -i "${vocalsPath}" 
-            -af "${filterChain}" 
-            -c:a libmp3lame -b:a 64k 
-            -y "${finalFilePath}"
-          `.replace(/\s+/g, " ");
-
-          exec(ffmpegCommand, (ffmpegError, ffmpegStdout, ffmpegStderr) => {
-            if (ffmpegError) {
-              console.warn(
-                `Skipping ${safeOriginalFilename}: Audio processing failed.`
-              );
-              return resolve(null);
-            }
-
-            // Step D: Cleanup
-            try {
-              const spleeterOutDir = path.join("temp_output", baseName);
-              if (fs.existsSync(spleeterOutDir)) {
-                fs.rmSync(spleeterOutDir, { recursive: true, force: true });
-              }
-            } catch (cleanupErr) {
-              console.error("Cleanup error:", cleanupErr);
-            }
-
-            return resolve(finalFilePath);
-          });
-        }
-      );
+          return resolve(finalFilePath);
+        });
+      });
     });
   });
 }
 
-const limit = pLimit(1); // Limit to 2 concurrent downloads
+const limit = pLimit(1); // Limit concurrency if needed
 app.post("/batch-download-mp3", async (req, res) => {
   try {
     const { videos } = req.body;
@@ -618,7 +510,7 @@ app.post("/batch-download-mp3", async (req, res) => {
     let finalPaths = await Promise.all(downloadPromises);
 
     // Remove failed downloads (null values)
-    finalPaths = finalPaths.filter((path) => path !== null);
+    finalPaths = finalPaths.filter((filePath) => filePath !== null);
 
     // If all failed, return an error
     if (finalPaths.length === 0) {
@@ -658,7 +550,7 @@ app.post("/batch-download-mp3", async (req, res) => {
     return res.json({
       message: "Batch MP3s downloaded & zipped",
       file: relativeZip,
-      skipped: true, // Indicate some files were skipped.
+      skipped: true, // Indicate some files were possibly skipped.
     });
   } catch (err) {
     console.error("Batch download error:", err);

@@ -138,6 +138,164 @@ app.get("/list-downloads", (req, res) => {
   }
 });
 
+// Process audio/video from any URL (not just YouTube)
+app.post("/process-external-audio", (req, res) => {
+  const { url, filename, audioOnly = true } = req.body;
+  console.log(url, filename, audioOnly);
+  if (!url) {
+    return res.status(400).json({ error: "URL is required" });
+  }
+
+  // Use a sanitized version of the provided filename or extract from URL
+  const providedFilename = filename || path.basename(url).split("?")[0];
+  const safeFilename = sanitizeFilenameForWindows(providedFilename).replace(
+    / /g,
+    "_"
+  );
+
+  // Create a folder for external files
+  const folderName = "external_audio";
+  const subFolder = path.join(DOWNLOAD_FOLDER, folderName);
+  if (!fs.existsSync(subFolder)) {
+    fs.mkdirSync(subFolder, { recursive: true });
+  }
+
+  // Ensure output filename has .mp3 extension
+  const baseFilename = safeFilename.replace(/\.\w+$/, "");
+  const mp3Filename = baseFilename + ".mp3";
+
+  // Paths for downloaded and processed files
+  const downloadPath = path.join(subFolder, `original_${safeFilename}`);
+  const finalFilePath = path.join(subFolder, mp3Filename);
+
+  if (fs.existsSync(finalFilePath)) {
+    return res.json({ message: "Already processed", skipped: true });
+  }
+
+  // Step 1: Download file using curl
+  const downloadCommand = `curl -L "${url}" -o "${downloadPath}"`;
+
+  exec(downloadCommand, (downloadError) => {
+    if (downloadError) {
+      console.error("Download error:", downloadError);
+      return res.status(500).json({ error: "Failed to download file" });
+    }
+
+    // Check if the file is a video file
+    const probeCommand = `ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "${downloadPath}"`;
+
+    exec(probeCommand, (probeError, probeStdout) => {
+      const hasVideoStream = !probeError && parseInt(probeStdout.trim()) > 0;
+
+      // For all files, we'll process to MP3, with different optimizations based on the input
+      const tempMp3Path = path.join(subFolder, `temp_${baseFilename}.mp3`);
+
+      // Extract audio for any file to MP3 format
+      const convertCommand = downloadPath.endsWith(".mp3")
+        ? `echo "Already MP3, skipping conversion"` // no-op if already mp3
+        : `ffmpeg -i "${downloadPath}" -vn -acodec libmp3lame "${tempMp3Path}"`;
+
+      exec(convertCommand, (convertError) => {
+        if (convertError && !downloadPath.endsWith(".mp3")) {
+          console.error("Conversion error:", convertError);
+          return res.status(500).json({ error: "Failed to convert to MP3" });
+        }
+
+        // Use original MP3 or the converted one
+        const sourceMp3 = downloadPath.endsWith(".mp3")
+          ? downloadPath
+          : tempMp3Path;
+
+        // Step 3: Run Demucs to separate vocals from accompaniment
+        const baseName = path.basename(sourceMp3, ".mp3");
+        const demucsCommand = `python demucs_wrapper.py --two-stems=vocals -o "temp_output" "${sourceMp3}"`;
+
+        exec(demucsCommand, (demucsError) => {
+          if (demucsError) {
+            console.error("Demucs separation failed:", demucsError);
+            return res.json({
+              message: "Downloaded but vocal separation failed",
+              skipped: false,
+            });
+          }
+
+          // Step 4: Process the vocals with FFmpeg
+          const vocalsPath = path.join(
+            "temp_output",
+            "htdemucs",
+            baseName,
+            "vocals.wav"
+          );
+
+          let filterChain = [
+            `silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1`,
+            `silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1`,
+            `afftdn`,
+            `acompressor`,
+            `volume=10dB`,
+            `aresample=96000`,
+          ].join(",");
+
+          const ffmpegCommand =
+            `ffmpeg -i "${vocalsPath}" -af "${filterChain}" -c:a libmp3lame -b:a 64k -y "${finalFilePath}"`.replace(
+              /\s+/g,
+              " "
+            );
+
+          exec(ffmpegCommand, (ffmpegError) => {
+            if (ffmpegError) {
+              console.error("Audio processing error:", ffmpegError);
+              return res.status(500).json({ error: "Audio processing failed" });
+            }
+
+            // Step 5: Cleanup
+            try {
+              const demucsOutDir = path.join(
+                "temp_output",
+                "htdemucs",
+                baseName
+              );
+              if (fs.existsSync(demucsOutDir)) {
+                fs.rmdirSync(demucsOutDir, { recursive: true });
+              }
+
+              // Delete the original download if not the same as final file
+              if (fs.existsSync(downloadPath)) {
+                fs.unlinkSync(downloadPath);
+              }
+
+              // Delete temp MP3 if it was created
+              if (tempMp3Path !== finalFilePath && fs.existsSync(tempMp3Path)) {
+                fs.unlinkSync(tempMp3Path);
+              }
+
+              const relativePath = path
+                .join(folderName, mp3Filename)
+                .replace(/\\/g, "/");
+              return res.json({
+                message: "File downloaded, converted to MP3, and processed",
+                file: relativePath,
+                skipped: false,
+                isVideo: hasVideoStream,
+                //full path from the device
+                fullPath: path.join(
+                  path.resolve(DOWNLOAD_FOLDER),
+                  relativePath.replace(/\\/g, "/")
+                ),
+              });
+            } catch (cleanupErr) {
+              console.error("Error during cleanup:", cleanupErr);
+              return res
+                .status(500)
+                .json({ error: "Error finalizing audio file" });
+            }
+          });
+        });
+      });
+    });
+  });
+});
+
 // Helper: Recursively get all MP3 files in a directory.
 function getFilesRecursively(dir, fileList = []) {
   const files = fs.readdirSync(dir);
@@ -304,6 +462,10 @@ app.post("/download-mp3", (req, res) => {
               message: "MP3 downloaded, vocals enhanced, and processed",
               file: relativePath,
               skipped: false,
+              // full path from the device
+              fullPath: path
+                .join(path.resolve(DOWNLOAD_FOLDER), relativePath)
+                .replace(/\\/g, "/"),
             });
           } catch (cleanupErr) {
             console.error("Error during cleanup:", cleanupErr);

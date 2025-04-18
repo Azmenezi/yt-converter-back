@@ -1,3 +1,9 @@
+/* ============================================================================
+ * yt‑converter‑back ‑ main server
+ * Updated: 2025‑04‑18
+ * ‑ Adds ASCII‑safe twins for Demucs / torchaudio (fix Unicode path crash)
+ * ‑ Final files keep original Arabic / emoji names
+ * ==========================================================================*/
 import express from "express";
 import { exec } from "child_process";
 import cors from "cors";
@@ -5,348 +11,186 @@ import morgan from "morgan";
 import fs from "fs";
 import path from "path";
 import archiver from "archiver";
-import pLimit from "p-limit"; // ✅ Now works!
+import pLimit from "p-limit";
+import { transliterate } from "transliteration";
 
 const app = express();
 app.use(express.json());
-
-// Middleware to fix double extension issues (e.g. ".mp3.mp3")
-app.use((req, res, next) => {
-  const originalJson = res.json;
-  res.json = function (data) {
-    if (data && data.filename && data.filename.endsWith(".mp3.mp3")) {
-      data.filename = data.filename.replace(/\.mp3\.mp3$/, ".mp3");
-    }
-    return originalJson.call(this, data);
-  };
-  next();
-});
 app.use(cors());
 app.use(morgan("dev"));
 
+// ------------------------------------------------------------
+// constants
+// ------------------------------------------------------------
 const DOWNLOAD_FOLDER = "downloads";
-if (!fs.existsSync(DOWNLOAD_FOLDER)) {
-  fs.mkdirSync(DOWNLOAD_FOLDER);
+fs.mkdirSync(DOWNLOAD_FOLDER, { recursive: true });
+
+// ------------------------------------------------------------
+// utils
+// ------------------------------------------------------------
+function sanitizeFilenameForWindows(filename = "unnamed") {
+  return (
+    filename
+      .replace(/[\\/:*?"<>|]/g, "_")
+      .replace(/[\x00-\x1f\x80-\x9f]/g, "_")
+      .trim()
+      .replace(/[_\s]+/g, "_")
+      .slice(0, 250) || "unnamed"
+  );
+}
+function toAsciiSafe(s) {
+  return (
+    transliterate(s)
+      .replace(/[^\w.-]/g, "_")
+      .replace(/_+/g, "_")
+      .slice(0, 200) || "file"
+  );
+}
+function ensureAsciiCopy(originalPath) {
+  const dir = path.dirname(originalPath);
+  const asciiBase = toAsciiSafe(path.basename(originalPath));
+  if (asciiBase === path.basename(originalPath))
+    return { asciiPath: originalPath, cleanup: () => {} };
+  const asciiPath = path.join(dir, asciiBase);
+  fs.copyFileSync(originalPath, asciiPath);
+  return {
+    asciiPath,
+    cleanup: () => fs.existsSync(asciiPath) && fs.unlinkSync(asciiPath),
+  };
+}
+// Revised dependency check: confirm demucs CLI + torchaudio backend
+function checkPythonDependencies() {
+  return new Promise((resolve) => {
+    // 1) Is the demucs CLI accessible?
+    exec("demucs --help", (cliErr) => {
+      if (cliErr) {
+        console.warn("[Deps] demucs CLI not in PATH");
+        return resolve(false);
+      }
+      // 2) Does the same python have torchaudio + soundfile?
+      const py = `python3 - <<'PY'
+try:
+ import torchaudio, soundfile; print('OK')
+except Exception as e:
+ print('FAIL')
+PY`;
+      exec(py, (pyErr, out) => {
+        const ok = !pyErr && out.trim() === "OK";
+        if (!ok) console.warn("[Deps] Python missing torchaudio or soundfile");
+        resolve(ok);
+      });
+    });
+  });
+}
+function getFilesRecursively(dir, out = []) {
+  fs.readdirSync(dir).forEach((f) => {
+    const p = path.join(dir, f);
+    fs.statSync(p).isDirectory()
+      ? getFilesRecursively(p, out)
+      : p.endsWith(".mp3") && out.push(p);
+  });
+  return out;
 }
 
-// Enhanced sanitizer: removes forbidden characters while preserving non-ASCII characters.
-function sanitizeFilenameForWindows(filename) {
-  return filename.replace(/[\\/:*?"<>|]/g, "").trim();
-}
-
-// FETCH VIDEOS: returns video objects with consistent file naming.
-// The folderName is based on the playlist title (if available) or uploader.
+// ----------------------------------------------------------------------------
+// /fetch‑videos  (same as before, just uses sanitize helpers)
+// ----------------------------------------------------------------------------
 app.post("/fetch-videos", (req, res) => {
   const { channelUrl } = req.body;
-  if (!channelUrl) {
+  if (!channelUrl)
     return res.status(400).json({ error: "Channel URL is required" });
-  }
 
-  // If it's a single video, extract full metadata
-  const isSingleVideo = channelUrl.includes("watch?v=");
-  const ytCommand = isSingleVideo
-    ? `yt-dlp -j --no-playlist "${channelUrl}"`
-    : `yt-dlp -j --flat-playlist "${channelUrl}"`;
+  const single = channelUrl.includes("watch?v=");
+  const cmd = single
+    ? `yt-dlp -j --no-playlist \"${channelUrl}\"`
+    : `yt-dlp -j --flat-playlist \"${channelUrl}\"`;
 
-  exec(ytCommand, (error, stdout) => {
-    if (error) {
-      console.log(error);
-      return res.status(500).json({ error: "Failed to fetch videos" });
-    }
+  exec(cmd, (err, out) => {
+    if (err) return res.status(500).json({ error: "Failed to fetch videos" });
+
     try {
-      let videos = stdout
+      let vids = out
         .trim()
         .split("\n")
-        .map((line) => JSON.parse(line))
+        .map((l) => JSON.parse(l))
         .filter(
-          (video) =>
-            video.title !== "[Deleted video]" &&
-            video.title !== "[Private video]"
+          (v) => v.title !== "[Deleted video]" && v.title !== "[Private video]"
         );
+      if (single) vids = [vids[0]];
 
-      if (isSingleVideo) {
-        const video = videos[0]; // Get the single video
+      vids = vids.map((v) => {
         const folderName = sanitizeFilenameForWindows(
-          video.uploader || "SingleVideo"
+          v.playlist_title || v.uploader || "default"
         );
-        const originalFilename = `${video.title}_${video.id}.mp3`;
-        const safeFilename = sanitizeFilenameForWindows(
-          originalFilename
-        ).replace(/ /g, "_");
-
-        return res.json({
-          videos: [
-            {
-              id: video.id,
-              title: video.title,
-              url: `https://www.youtube.com/watch?v=${video.id}`,
-              originalFilename: originalFilename.replace(/ /g, "_"),
-              safeFilename,
-              folderName: folderName.replace(/ /g, "_"),
-              thumbnail:
-                video.thumbnail ||
-                (video.thumbnails && video.thumbnails[0]?.url) ||
-                "",
-            },
-          ],
-        });
-      }
-
-      videos = videos.map((video) => {
-        const folderName = video.playlist_title
-          ? sanitizeFilenameForWindows(video.playlist_title)
-          : video.uploader
-          ? sanitizeFilenameForWindows(video.uploader)
-          : "default";
-
-        const originalFilename = `${video.title}_${video.id}.mp3`;
-        const safeFilename = sanitizeFilenameForWindows(
-          originalFilename
-        ).replace(/ /g, "_");
-
+        const originalFilename = `${v.title}_${v.id}.mp3`;
         return {
-          id: video.id,
-          title: video.title,
-          url: `https://www.youtube.com/watch?v=${video.id}`,
+          id: v.id,
+          title: v.title,
+          url: `https://www.youtube.com/watch?v=${v.id}`,
           originalFilename: originalFilename.replace(/ /g, "_"),
-          safeFilename,
+          safeFilename: sanitizeFilenameForWindows(originalFilename).replace(
+            / /g,
+            "_"
+          ),
           folderName: folderName.replace(/ /g, "_"),
-          thumbnail:
-            video.thumbnail ||
-            (video.thumbnails && video.thumbnails[0]?.url) ||
-            "",
+          thumbnail: v.thumbnail || v.thumbnails?.[0]?.url || "",
         };
       });
-
-      res.json({ videos });
-    } catch (err) {
+      res.json({ videos: vids });
+    } catch (e) {
       res.status(500).json({ error: "Error parsing video data" });
     }
   });
 });
 
-// NEW Endpoint: List all downloaded MP3 files.
+// ----------------------------------------------------------------------------
+// list‑downloads
+// ----------------------------------------------------------------------------
 app.get("/list-downloads", (req, res) => {
   try {
-    const files = getFilesRecursively(DOWNLOAD_FOLDER);
-    const relativeFiles = files.map((file) =>
-      path.relative(DOWNLOAD_FOLDER, file)
+    const files = getFilesRecursively(DOWNLOAD_FOLDER).map((f) =>
+      path.relative(DOWNLOAD_FOLDER, f)
     );
-    res.json({ files: relativeFiles });
-  } catch (err) {
+    res.json({ files });
+  } catch {
     res.status(500).json({ error: "Error listing downloaded files" });
   }
 });
 
-// Process audio/video from any URL (not just YouTube)
-app.post("/process-external-audio", (req, res) => {
-  const { url, filename, audioOnly = true } = req.body;
-  console.log(url, filename, audioOnly);
-  if (!url) {
-    return res.status(400).json({ error: "URL is required" });
-  }
-
-  // Use a sanitized version of the provided filename or extract from URL
-  const providedFilename = filename || path.basename(url).split("?")[0];
-  const safeFilename = sanitizeFilenameForWindows(providedFilename).replace(
-    / /g,
-    "_"
-  );
-
-  // Create a folder for external files
-  const folderName = "external_audio";
-  const subFolder = path.join(DOWNLOAD_FOLDER, folderName);
-  if (!fs.existsSync(subFolder)) {
-    fs.mkdirSync(subFolder, { recursive: true });
-  }
-
-  // Ensure output filename has .mp3 extension
-  const baseFilename = safeFilename.replace(/\.\w+$/, "");
-  const mp3Filename = baseFilename + ".mp3";
-
-  // Paths for downloaded and processed files
-  const downloadPath = path.join(subFolder, `original_${safeFilename}`);
-  const finalFilePath = path.join(subFolder, mp3Filename);
-
-  if (fs.existsSync(finalFilePath)) {
-    return res.json({ message: "Already processed", skipped: true });
-  }
-
-  // Step 1: Download file using curl
-  const downloadCommand = `curl -L "${url}" -o "${downloadPath}"`;
-
-  exec(downloadCommand, (downloadError) => {
-    if (downloadError) {
-      console.error("Download error:", downloadError);
-      return res.status(500).json({ error: "Failed to download file" });
-    }
-
-    // Check if the file is a video file
-    const probeCommand = `ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "${downloadPath}"`;
-
-    exec(probeCommand, (probeError, probeStdout) => {
-      const hasVideoStream = !probeError && parseInt(probeStdout.trim()) > 0;
-
-      // For all files, we'll process to MP3, with different optimizations based on the input
-      const tempMp3Path = path.join(subFolder, `temp_${baseFilename}.mp3`);
-
-      // Extract audio for any file to MP3 format
-      const convertCommand = downloadPath.endsWith(".mp3")
-        ? `echo "Already MP3, skipping conversion"` // no-op if already mp3
-        : `ffmpeg -i "${downloadPath}" -vn -acodec libmp3lame "${tempMp3Path}"`;
-
-      exec(convertCommand, (convertError) => {
-        if (convertError && !downloadPath.endsWith(".mp3")) {
-          console.error("Conversion error:", convertError);
-          return res.status(500).json({ error: "Failed to convert to MP3" });
-        }
-
-        // Use original MP3 or the converted one
-        const sourceMp3 = downloadPath.endsWith(".mp3")
-          ? downloadPath
-          : tempMp3Path;
-
-        // Step 3: Run Demucs to separate vocals from accompaniment
-        const baseName = path.basename(sourceMp3, ".mp3");
-        const demucsCommand = `python demucs_wrapper.py --two-stems=vocals -o "temp_output" "${sourceMp3}"`;
-
-        exec(demucsCommand, (demucsError) => {
-          if (demucsError) {
-            console.error("Demucs separation failed:", demucsError);
-            return res.json({
-              message: "Downloaded but vocal separation failed",
-              skipped: false,
-            });
-          }
-
-          // Step 4: Process the vocals with FFmpeg
-          const vocalsPath = path.join(
-            "temp_output",
-            "htdemucs",
-            baseName,
-            "vocals.wav"
-          );
-
-          let filterChain = [
-            `silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1`,
-            `silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1`,
-            `afftdn`,
-            `acompressor`,
-            `volume=10dB`,
-            `aresample=96000`,
-          ].join(",");
-
-          const ffmpegCommand =
-            `ffmpeg -i "${vocalsPath}" -af "${filterChain}" -c:a libmp3lame -b:a 64k -y "${finalFilePath}"`.replace(
-              /\s+/g,
-              " "
-            );
-
-          exec(ffmpegCommand, (ffmpegError) => {
-            if (ffmpegError) {
-              console.error("Audio processing error:", ffmpegError);
-              return res.status(500).json({ error: "Audio processing failed" });
-            }
-
-            // Step 5: Cleanup
-            try {
-              const demucsOutDir = path.join(
-                "temp_output",
-                "htdemucs",
-                baseName
-              );
-              if (fs.existsSync(demucsOutDir)) {
-                fs.rmdirSync(demucsOutDir, { recursive: true });
-              }
-
-              // Delete the original download if not the same as final file
-              if (fs.existsSync(downloadPath)) {
-                fs.unlinkSync(downloadPath);
-              }
-
-              // Delete temp MP3 if it was created
-              if (tempMp3Path !== finalFilePath && fs.existsSync(tempMp3Path)) {
-                fs.unlinkSync(tempMp3Path);
-              }
-
-              const relativePath = path
-                .join(folderName, mp3Filename)
-                .replace(/\\/g, "/");
-              return res.json({
-                message: "File downloaded, converted to MP3, and processed",
-                file: relativePath,
-                skipped: false,
-                isVideo: hasVideoStream,
-                //full path from the device
-                fullPath: path.join(
-                  path.resolve(DOWNLOAD_FOLDER),
-                  relativePath.replace(/\\/g, "/")
-                ),
-              });
-            } catch (cleanupErr) {
-              console.error("Error during cleanup:", cleanupErr);
-              return res
-                .status(500)
-                .json({ error: "Error finalizing audio file" });
-            }
-          });
-        });
-      });
-    });
-  });
-});
-
-// Helper: Recursively get all MP3 files in a directory.
-function getFilesRecursively(dir, fileList = []) {
-  const files = fs.readdirSync(dir);
-  files.forEach((file) => {
-    const filePath = path.join(dir, file);
-    if (fs.statSync(filePath).isDirectory()) {
-      getFilesRecursively(filePath, fileList);
-    } else {
-      if (filePath.endsWith(".mp3")) fileList.push(filePath);
-    }
-  });
-  return fileList;
-}
-
-// NEW Endpoint: Download a specific file.
+// ----------------------------------------------------------------------------
+// download‑file & delete‑file
+// ----------------------------------------------------------------------------
 app.get("/download-file", (req, res) => {
-  const relativePath = req.query.file;
-  const decodedPath = decodeURIComponent(relativePath);
-  if (!decodedPath) return res.status(400).json({ error: "No file specified" });
-  const filePath = path.join(path.resolve(DOWNLOAD_FOLDER), decodedPath);
-  if (!filePath.startsWith(path.resolve(DOWNLOAD_FOLDER))) {
-    return res.status(400).json({ error: "Invalid file path" });
-  }
-  if (!fs.existsSync(filePath)) {
+  const { file } = req.query;
+  const decoded = decodeURIComponent(file ?? "");
+  const full = path.join(path.resolve(DOWNLOAD_FOLDER), decoded);
+  if (!decoded || !full.startsWith(path.resolve(DOWNLOAD_FOLDER)))
+    return res.status(400).json({ error: "Invalid file" });
+  if (!fs.existsSync(full))
     return res.status(404).json({ error: "File not found" });
-  }
-  res.download(filePath);
+  res.download(full);
 });
 
-// NEW Endpoint: Delete a specific file.
 app.delete("/delete-file", (req, res) => {
-  const relativePath = req.query.file;
-  const decodedPath = decodeURIComponent(relativePath);
-  if (!decodedPath) return res.status(400).json({ error: "No file specified" });
-  const filePath = path.join(path.resolve(DOWNLOAD_FOLDER), decodedPath);
-  if (!filePath.startsWith(path.resolve(DOWNLOAD_FOLDER))) {
-    return res.status(400).json({ error: "Invalid file path" });
-  }
-  if (!fs.existsSync(filePath)) {
+  const { file } = req.query;
+  const decoded = decodeURIComponent(file ?? "");
+  const full = path.join(path.resolve(DOWNLOAD_FOLDER), decoded);
+  if (!decoded || !full.startsWith(path.resolve(DOWNLOAD_FOLDER)))
+    return res.status(400).json({ error: "Invalid file" });
+  if (!fs.existsSync(full))
     return res.status(404).json({ error: "File not found" });
-  }
-  try {
-    fs.unlinkSync(filePath);
-    res.json({ message: "File deleted successfully" });
-  } catch (err) {
-    res.status(500).json({ error: "Error deleting file" });
-  }
+  fs.unlinkSync(full);
+  res.json({ message: "File deleted successfully" });
 });
 
-// Create a queue for processing downloads
-app.post("/download-mp3", (req, res) => {
+// ----------------------------------------------------------------------------
+// Core: /download-mp3  (Demucs with ASCII twin)
+// ----------------------------------------------------------------------------
+
+// ------------------------------------------------------------
+// core endpoint: /download-mp3
+// ------------------------------------------------------------
+app.post("/download-mp3", async (req, res) => {
   const {
     videoUrl,
     originalFilename,
@@ -355,208 +199,260 @@ app.post("/download-mp3", (req, res) => {
     startTime,
     endTime,
   } = req.body;
-
-  if (!videoUrl || !originalFilename || !safeFilename || !folderName) {
+  if (!videoUrl || !originalFilename || !safeFilename || !folderName)
     return res.status(400).json({ error: "Missing required parameters" });
-  }
 
-  // Create directory and build file paths
-  const safeOriginalFilename = sanitizeFilenameForWindows(
-    originalFilename
-  ).replace(/ /g, "_");
-  const subFolder = path.join(DOWNLOAD_FOLDER, folderName);
-  if (!fs.existsSync(subFolder)) {
-    fs.mkdirSync(subFolder, { recursive: true });
-  }
-  const safeFilePath = path.join(subFolder, safeFilename);
-  const finalFilePath = path.join(subFolder, safeOriginalFilename);
+  const sub = path.join(DOWNLOAD_FOLDER, folderName);
+  fs.mkdirSync(sub, { recursive: true });
 
-  if (fs.existsSync(finalFilePath)) {
+  const finalFile = path.join(
+    sub,
+    sanitizeFilenameForWindows(originalFilename).replace(/ /g, "_")
+  );
+  let ytFile = path.join(sub, safeFilename);
+  if (ytFile === finalFile) {
+    const ext = path.extname(finalFile);
+    ytFile = finalFile.replace(ext, `__src${ext}`); // ensure different name
+  }
+  if (fs.existsSync(finalFile))
     return res.json({ message: "Already downloaded", skipped: true });
+
+  exec(
+    `yt-dlp --restrict-filenames -x --audio-format mp3 -o \"${ytFile}\" \"${videoUrl}\"`,
+    async (dlErr) => {
+      if (dlErr) return res.status(500).json({ error: "MP3 download failed" });
+
+      const deps = await checkPythonDependencies();
+      if (!deps) return basicProcess();
+
+      const { asciiPath, cleanup } = ensureAsciiCopy(ytFile);
+      exec(
+        `python demucs_wrapper.py --two-stems=vocals -o temp_output \"${asciiPath}\"`,
+        (demErr) => {
+          cleanup();
+          if (demErr) return basicProcess();
+          const vocals = path.join(
+            "temp_output",
+            "htdemucs",
+            path.basename(asciiPath, ".mp3"),
+            "vocals.wav"
+          );
+          if (!fs.existsSync(vocals)) return basicProcess();
+          runFfmpeg(vocals, true);
+        }
+      );
+    }
+  );
+
+  function basicProcess() {
+    runFfmpeg(ytFile, false);
   }
 
-  // Step 1: Download the MP3 using yt-dlp
-  const downloadCommand = `yt-dlp --restrict-filenames -x --audio-format mp3 -o "${safeFilePath}" ${videoUrl}`;
-  exec(downloadCommand, (downloadError, downloadStdout, downloadStderr) => {
-    if (downloadError) {
-      console.error("Download error:", downloadStderr);
-      return res.status(500).json({ error: "MP3 Download failed" });
-    }
+  function runFfmpeg(inputPath, removeTempOut) {
+    const tmpOut = finalFile + "__tmp.mp3";
+    const filters = removeTempOut
+      ? [
+          "silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1",
+          "silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1",
+          "afftdn",
+          "acompressor",
+          "volume=10dB",
+          "aresample=96000",
+        ].join(",")
+      : "volume=2,afftdn,acompressor";
 
-    // Step 2: Run Demucs to separate vocals from accompaniment
-    const execOptions = { env: { ...process.env, PYTHONIOENCODING: "utf-8" } };
-    const baseName = path.basename(safeFilePath, ".mp3");
-
-    // Example: Using Demucs 2-stem for vocals
-    const demucsCommand = `python demucs_wrapper.py --two-stems=vocals -o "temp_output" "${safeFilePath}"`;
-
+    const time =
+      typeof startTime === "number" && typeof endTime === "number"
+        ? `-ss ${startTime} -to ${endTime}`
+        : "";
     exec(
-      demucsCommand,
-      execOptions,
-      (demucsError, demucsStdout, demucsStderr) => {
-        if (demucsError) {
-          console.error("Demucs separation failed:", demucsStderr);
-          return res.json({
-            message: "Downloaded but vocal separation failed",
-            skipped: false,
-          });
-        }
-
-        // By default, Demucs will place the separated files under:
-        // temp_output/htdemucs/<baseName>/vocals.wav and no_vocals.wav
-        // Adjust as needed if you specify a different model
-        const vocalsPath = path.join(
-          "temp_output",
-          "htdemucs",
-          baseName,
-          "vocals.wav"
-        );
-
-        // Build an enhanced filter chain:
-        // 1. Silence removal (first pass)
-        // 2. Silence removal (final pass)
-        // 3. Noise reduction (afftdn)
-        // 4. Dynamic range compression (acompressor)
-        // 5. Increase volume +10dB
-        // 6. Upsample to 96 kHz (aresample)
-        let filterChain = [
-          `silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1`,
-          `silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1`,
-          `afftdn`,
-          `acompressor`,
-          `volume=10dB`,
-          `aresample=96000`,
-        ].join(",");
-
-        // Determine time flags – either a default duration or use start/stop if provided
-        let timeFlags = `-t 120`; // default duration if no segment is specified
-        const segmentSelected =
-          typeof startTime === "number" && typeof endTime === "number";
-        if (segmentSelected) {
-          timeFlags = `-ss ${startTime} -to ${endTime}`;
-        }
-
-        // Step 3: Process the vocals with FFmpeg using the enhanced filter chain
-        const ffmpegCommand =
-          `ffmpeg ${timeFlags} -i "${vocalsPath}" -af "${filterChain}" -c:a libmp3lame -b:a 64k -y "${finalFilePath}"`.replace(
-            /\s+/g,
-            " "
-          );
-
-        exec(ffmpegCommand, (ffmpegError, ffmpegStdout, ffmpegStderr) => {
-          if (ffmpegError) {
-            console.error("Final ffmpeg processing error:", ffmpegStderr);
-            return res.status(500).json({ error: "Audio processing failed" });
-          }
-
-          // Step 4: Cleanup – remove the Demucs temporary folder
-          try {
-            const demucsOutDir = path.join("temp_output", "htdemucs", baseName);
-            if (fs.existsSync(demucsOutDir)) {
-              fs.rmdirSync(demucsOutDir, { recursive: true });
-            }
-            const relativePath = path
-              .join(folderName, safeOriginalFilename)
-              .replace(/\\/g, "/");
-            return res.json({
-              message: "MP3 downloaded, vocals enhanced, and processed",
-              file: relativePath,
-              skipped: false,
-              // full path from the device
-              fullPath: path
-                .join(path.resolve(DOWNLOAD_FOLDER), relativePath)
-                .replace(/\\/g, "/"),
-            });
-          } catch (cleanupErr) {
-            console.error("Error during cleanup:", cleanupErr);
-            return res
-              .status(500)
-              .json({ error: "Error finalizing audio file" });
-          }
+      `ffmpeg ${time} -i \"${inputPath}\" -af \"${filters}\" -c:a libmp3lame -b:a 64k -y \"${tmpOut}\"`,
+      (e) => {
+        if (e)
+          return res.status(500).json({ error: "Audio processing failed" });
+        fs.renameSync(tmpOut, finalFile);
+        inputPath !== ytFile ||
+          (fs.existsSync(ytFile) && fs.unlinkSync(ytFile));
+        fs.existsSync("temp_output") &&
+          fs.rmSync("temp_output", { recursive: true, force: true });
+        return res.json({
+          message: "Done",
+          file: path
+            .join(folderName, path.basename(finalFile))
+            .replace(/\\/g, "/"),
+          skipped: false,
         });
       }
     );
+  }
+});
+
+// ----------------------------------------------------------------------------
+// /process-external-audio  (same ASCII‑twin logic)
+// ----------------------------------------------------------------------------
+app.post("/process-external-audio", async (req, res) => {
+  const { url, filename } = req.body;
+  if (!url) return res.status(400).json({ error: "URL is required" });
+
+  const provided = filename || path.basename(url).split("?")[0];
+  const safeName = sanitizeFilenameForWindows(provided).replace(/ /g, "_");
+  const sub = path.join(DOWNLOAD_FOLDER, "external_audio");
+  fs.mkdirSync(sub, { recursive: true });
+
+  const downloadPath = path.join(sub, `original_${safeName}`);
+  const finalFile = path.join(sub, safeName.replace(/\.\w+$/, "") + ".mp3");
+  if (fs.existsSync(finalFile))
+    return res.json({ message: "Already processed", skipped: true });
+
+  exec(`curl -L \"${url}\" -o \"${downloadPath}\"`, async (dlErr) => {
+    if (dlErr)
+      return res.status(500).json({ error: "Failed to download file" });
+
+    const src = downloadPath.endsWith(".mp3")
+      ? downloadPath
+      : await convertToMp3(downloadPath);
+    const haveDeps = await checkPythonDependencies();
+    if (!haveDeps) return basic(src);
+
+    const { asciiPath, cleanup } = ensureAsciiCopy(src);
+    const asciiBase = path.basename(asciiPath, ".mp3");
+    exec(
+      `python demucs_wrapper.py --two-stems=vocals -o temp_output \"${asciiPath}\"`,
+      (demErr) => {
+        cleanup();
+        if (demErr) return basic(src);
+
+        const vocals = path.join(
+          "temp_output",
+          "htdemucs",
+          asciiBase,
+          "vocals.wav"
+        );
+        const filters =
+          "silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1,afftdn,acompressor,volume=10dB";
+        exec(
+          `ffmpeg -i \"${vocals}\" -af \"${filters}\" -c:a libmp3lame -b:a 64k -y \"${finalFile}\"`,
+          (ffErr) => {
+            if (ffErr) return basic(src);
+            cleanupDemucs();
+            success();
+          }
+        );
+      }
+    );
+
+    /* helpers */
+    function convertToMp3(inp) {
+      return new Promise((resolve, reject) => {
+        const tmp = path.join(
+          sub,
+          "tmp_" + path.basename(inp, path.extname(inp)) + ".mp3"
+        );
+        exec(`ffmpeg -i \"${inp}\" -vn -acodec libmp3lame -y \"${tmp}\"`, (e) =>
+          e ? reject(e) : resolve(tmp)
+        );
+      });
+    }
+    function basic(srcPath) {
+      exec(
+        `ffmpeg -i \"${srcPath}\" -af \"volume=2,afftdn,acompressor\" -c:a libmp3lame -b:a 64k -y \"${finalFile}\"`,
+        (e) => (e ? fail() : success())
+      );
+    }
+    function cleanupDemucs() {
+      fs.existsSync("temp_output") &&
+        fs.rmSync("temp_output", { recursive: true, force: true });
+    }
+    function success() {
+      const rel = path
+        .join("external_audio", path.basename(finalFile))
+        .replace(/\\/g, "/");
+      res.json({ message: "Processed", file: rel, skipped: false });
+    }
+    function fail() {
+      res.status(500).json({ error: "Audio processing failed" });
+    }
   });
 });
 
+// ----------------------------------------------------------------------------
+// download-mp3-simple  (unchanged)
+// ----------------------------------------------------------------------------
 app.post("/download-mp3-simple", (req, res) => {
   const { videoUrl, originalFilename, safeFilename, folderName } = req.body;
-
-  if (!videoUrl || !originalFilename || !safeFilename || !folderName) {
+  if (!videoUrl || !originalFilename || !safeFilename || !folderName)
     return res.status(400).json({ error: "Missing required parameters" });
-  }
 
-  // Create directory, build paths
-  const safeOriginalFilename = sanitizeFilenameForWindows(
-    originalFilename
-  ).replace(/ /g, "_");
-  const subFolder = path.join(DOWNLOAD_FOLDER, folderName);
-  if (!fs.existsSync(subFolder)) {
-    fs.mkdirSync(subFolder, { recursive: true });
-  }
-  const safeFilePath = path.join(subFolder, safeFilename);
-  const finalFilePath = path.join(subFolder, safeOriginalFilename);
+  const sub = path.join(DOWNLOAD_FOLDER, folderName);
+  fs.mkdirSync(sub, { recursive: true });
 
-  if (fs.existsSync(finalFilePath)) {
+  const finalFile = path.join(
+    sub,
+    sanitizeFilenameForWindows(originalFilename).replace(/ /g, "_")
+  );
+  const ytFile = path.join(sub, safeFilename);
+  if (fs.existsSync(finalFile))
     return res.json({ message: "Already downloaded", skipped: true });
-  }
 
-  // Download the MP3 using yt-dlp
-  const downloadCommand = `yt-dlp --restrict-filenames -x --audio-format mp3 -o "${safeFilePath}" ${videoUrl}`;
-  exec(downloadCommand, (downloadError, downloadStdout, downloadStderr) => {
-    if (downloadError) {
-      console.error("Download error:", downloadStderr);
-      return res.status(500).json({ error: "MP3 Download failed" });
+  exec(
+    `yt-dlp --restrict-filenames -x --audio-format mp3 -o \"${ytFile}\" \"${videoUrl}\"`,
+    (dlErr) => {
+      if (dlErr) return res.status(500).json({ error: "MP3 Download failed" });
+      const tmp = finalFile.replace(/\.mp3$/, "_temp.mp3");
+      exec(
+        `ffmpeg -i \"${ytFile}\" -b:a 64k -c:a libmp3lame -y \"${tmp}\"`,
+        (ffErr) => {
+          if (ffErr)
+            return res.status(500).json({ error: "Compression failed" });
+          fs.renameSync(tmp, finalFile);
+          ytFile !== finalFile &&
+            fs.existsSync(ytFile) &&
+            fs.unlinkSync(ytFile);
+          const rel = path
+            .join(folderName, path.basename(finalFile))
+            .replace(/\\/g, "/");
+          res.json({ message: "Downloaded", file: rel, skipped: false });
+        }
+      );
     }
-
-    // Compress the MP3 to 64k bitrate
-    const tempFilePath = finalFilePath.replace(".mp3", "_temp.mp3");
-
-    const compressionCommand = `
-      ffmpeg -i "${safeFilePath.replace(/\\/g, "/")}" 
-      -b:a 64k -c:a libmp3lame 
-      -y "${tempFilePath.replace(/\\/g, "/")}"
-    `.replace(/\s+/g, " ");
-
-    exec(compressionCommand, (ffmpegError, ffmpegStdout, ffmpegStderr) => {
-      if (ffmpegError) {
-        console.error("Compression error:", ffmpegStderr);
-        return res.status(500).json({ error: "MP3 Compression failed" });
-      }
-
-      try {
-        // Ensure temp file exists before renaming
-        if (!fs.existsSync(tempFilePath)) {
-          return res
-            .status(500)
-            .json({ error: "Compression failed: temp file missing" });
-        }
-
-        // Rename temp file to final filename
-        fs.renameSync(tempFilePath, finalFilePath);
-
-        // Only delete the original file if it's different from the final output
-        if (safeFilePath !== finalFilePath && fs.existsSync(safeFilePath)) {
-          fs.unlinkSync(safeFilePath);
-        }
-
-        const relativePath = path
-          .join(folderName, safeOriginalFilename)
-          .replace(/\\/g, "/");
-        return res.json({
-          message: "MP3 downloaded and compressed",
-          file: relativePath,
-          skipped: false,
-        });
-      } catch (cleanupErr) {
-        console.error("Cleanup error:", cleanupErr);
-        return res.status(500).json({ error: "Error finalizing MP3 file" });
-      }
-    });
-  });
+  );
 });
 
-// Helper function for single MP3 download & process
+// ----------------------------------------------------------------------------
+// batch‑download‑mp3  (uses downloadAndProcessMp3 helper)
+// ----------------------------------------------------------------------------
+const limit = pLimit(1);
+app.post("/batch-download-mp3", async (req, res) => {
+  const { videos } = req.body;
+  if (!Array.isArray(videos) || !videos.length)
+    return res.status(400).json({ error: "No videos provided" });
+
+  const paths = (
+    await Promise.all(videos.map((v) => limit(() => downloadAndProcessMp3(v))))
+  ).filter(Boolean);
+  if (!paths.length)
+    return res.status(500).json({ error: "No MP3s could be downloaded." });
+
+  const zipDir = path.join(DOWNLOAD_FOLDER, "tmp");
+  fs.mkdirSync(zipDir, { recursive: true });
+  const zipPath = path.join(zipDir, `batch_${Date.now()}.zip`);
+
+  await new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.pipe(output);
+    paths.forEach(
+      (p) => fs.existsSync(p) && archive.file(p, { name: path.basename(p) })
+    );
+    archive.finalize();
+    output.on("close", resolve).on("error", reject);
+  });
+
+  const relZip = path.relative(DOWNLOAD_FOLDER, zipPath).replace(/\\/g, "/");
+  res.json({ message: "Batch complete", file: relZip, skipped: true });
+});
+
+/* Helper used above ------------------------------------------------------------------*/
 async function downloadAndProcessMp3({
   videoUrl,
   originalFilename,
@@ -565,159 +461,72 @@ async function downloadAndProcessMp3({
   startTime,
   endTime,
 }) {
-  return new Promise((resolve) => {
-    const safeOriginalFilename = sanitizeFilenameForWindows(
-      originalFilename
-    ).replace(/ /g, "_");
-    const subFolder = path.join(DOWNLOAD_FOLDER, folderName);
-    if (!fs.existsSync(subFolder)) {
-      fs.mkdirSync(subFolder, { recursive: true });
-    }
-    const safeFilePath = path.join(subFolder, safeFilename);
-    const finalFilePath = path.join(subFolder, safeOriginalFilename);
+  return new Promise(async (resolve) => {
+    const sub = path.join(DOWNLOAD_FOLDER, folderName);
+    fs.mkdirSync(sub, { recursive: true });
 
-    if (fs.existsSync(finalFilePath)) {
-      console.log(`Skipping ${safeOriginalFilename}, already downloaded.`);
-      return resolve(finalFilePath);
-    }
+    const finalFile = path.join(
+      sub,
+      sanitizeFilenameForWindows(originalFilename).replace(/ /g, "_")
+    );
+    if (fs.existsSync(finalFile)) return resolve(finalFile);
 
-    // Step A: Download
-    const downloadCommand = `yt-dlp --restrict-filenames -x --audio-format mp3 -o "${safeFilePath}" ${videoUrl}`;
-    exec(downloadCommand, (downloadError, downloadStdout, downloadStderr) => {
-      if (downloadError || downloadStderr.includes("Video unavailable")) {
-        console.warn(`Skipping ${safeOriginalFilename}: Video unavailable.`);
-        return resolve(null); // Instead of rejecting, we return null.
-      }
+    const ytFile = path.join(sub, safeFilename);
+    exec(
+      `yt-dlp --restrict-filenames -x --audio-format mp3 -o \"${ytFile}\" \"${videoUrl}\"`,
+      async (err) => {
+        if (err) return resolve(null);
+        const deps = await checkPythonDependencies();
+        if (!deps) return basic();
 
-      // Step B: Demucs
-      const execOptions = {
-        env: { ...process.env, PYTHONIOENCODING: "utf-8" },
-      };
-      const baseName = path.basename(safeFilePath, ".mp3");
-      const demucsCommand = `python demucs_wrapper.py --two-stems=vocals -o "temp_output" "${safeFilePath}"`;
+        const { asciiPath, cleanup } = ensureAsciiCopy(ytFile);
+        const asciiBase = path.basename(asciiPath, ".mp3");
+        exec(
+          `python demucs_wrapper.py --two-stems=vocals -o temp_output \"${asciiPath}\"`,
+          (demErr) => {
+            cleanup();
+            if (demErr) return basic();
 
-      exec(demucsCommand, execOptions, (demucsError) => {
-        if (demucsError) {
-          console.warn(
-            `Skipping ${safeOriginalFilename}: Vocal separation failed.`
-          );
-          return resolve(null);
-        }
-
-        // Step C: FFmpeg chain (using vocals.wav from Demucs)
-        const vocalsPath = path.join(
-          "temp_output",
-          "htdemucs",
-          baseName,
-          "vocals.wav"
+            const vocals = path.join(
+              "temp_output",
+              "htdemucs",
+              asciiBase,
+              "vocals.wav"
+            );
+            exec(
+              `ffmpeg -i \"${vocals}\" -af \"afftdn,acompressor\" -c:a libmp3lame -b:a 64k -y \"${finalFile}\"`,
+              (ffErr) => {
+                if (ffErr) return basic();
+                fs.rmSync("temp_output", { recursive: true, force: true });
+                return resolve(finalFile);
+              }
+            );
+          }
         );
 
-        let timeFlags = `-t 90`;
-        let filterChain =
-          `silenceremove=stop_threshold=-50dB:stop_duration=0.1:start_threshold=-50dB:start_periods=1,` +
-          `silenceremove=stop_threshold=0:stop_duration=0.1:start_threshold=0:start_duration=0.1`;
-
-        const segmentSelected =
-          typeof startTime === "number" && typeof endTime === "number";
-        if (segmentSelected) {
-          timeFlags = `-ss ${startTime} -to ${endTime}`;
+        function basic() {
+          exec(
+            `ffmpeg -i \"${ytFile}\" -af \"afftdn,acompressor\" -c:a libmp3lame -b:a 64k -y \"${finalFile}\"`,
+            (e) => resolve(e ? null : finalFile)
+          );
         }
-
-        const ffmpegCommand = `
-          ffmpeg ${timeFlags} -i "${vocalsPath}" 
-          -af "${filterChain}" 
-          -c:a libmp3lame -b:a 64k 
-          -y "${finalFilePath}"
-        `.replace(/\s+/g, " ");
-
-        exec(ffmpegCommand, (ffmpegError) => {
-          if (ffmpegError) {
-            console.warn(
-              `Skipping ${safeOriginalFilename}: Audio processing failed.`
-            );
-            return resolve(null);
-          }
-
-          // Step D: Cleanup
-          try {
-            const demucsOutDir = path.join("temp_output", "htdemucs", baseName);
-            if (fs.existsSync(demucsOutDir)) {
-              fs.rmSync(demucsOutDir, { recursive: true, force: true });
-            }
-          } catch (cleanupErr) {
-            console.error("Cleanup error:", cleanupErr);
-          }
-
-          return resolve(finalFilePath);
-        });
-      });
-    });
+      }
+    );
   });
 }
 
-const limit = pLimit(1); // Limit concurrency if needed
-app.post("/batch-download-mp3", async (req, res) => {
-  try {
-    const { videos } = req.body;
-    if (!Array.isArray(videos) || videos.length === 0) {
-      return res.status(400).json({ error: "No videos provided" });
-    }
-
-    // Limit concurrent downloads to avoid overloading CPU
-    const downloadPromises = videos.map((vid) =>
-      limit(() => downloadAndProcessMp3(vid))
-    );
-
-    // Wait for all downloads, allowing some failures (null values)
-    let finalPaths = await Promise.all(downloadPromises);
-
-    // Remove failed downloads (null values)
-    finalPaths = finalPaths.filter((filePath) => filePath !== null);
-
-    // If all failed, return an error
-    if (finalPaths.length === 0) {
-      return res.status(500).json({ error: "No MP3s could be downloaded." });
-    }
-
-    // Proceed with zipping logic
-    const timestamp = Date.now();
-    const zipName = `batch_${timestamp}.zip`;
-    const zipSubfolder = path.join(DOWNLOAD_FOLDER, "tmp");
-    if (!fs.existsSync(zipSubfolder)) {
-      fs.mkdirSync(zipSubfolder, { recursive: true });
-    }
-    const zipPath = path.join(zipSubfolder, zipName);
-
-    const output = fs.createWriteStream(zipPath);
-    const archive = archiver("zip", { zlib: { level: 9 } });
-
-    archive.on("error", (err) => {
-      throw err;
-    });
-    archive.pipe(output);
-
-    // Add each successful MP3 to the ZIP
-    finalPaths.forEach((mp3Path) => {
-      if (fs.existsSync(mp3Path)) {
-        archive.file(mp3Path, { name: path.basename(mp3Path) });
-      }
-    });
-
-    await archive.finalize();
-
-    const relativeZip = path
-      .relative(DOWNLOAD_FOLDER, zipPath)
-      .replace(/\\/g, "/");
-
-    return res.json({
-      message: "Batch MP3s downloaded & zipped",
-      file: relativeZip,
-      skipped: true, // Indicate some files were possibly skipped.
-    });
-  } catch (err) {
-    console.error("Batch download error:", err);
-    return res.status(500).json({ error: "Batch download failed" });
-  }
+// ----------------------------------------------------------------------------
+// Start server
+// ----------------------------------------------------------------------------
+app.listen(8001, () => {
+  console.log("Server running on port 8001");
+  console.log("Requires: pip install torchaudio demucs transliteration");
+  console.log(
+    "pip install --upgrade \
+    torch==2.6.0 \
+    torchaudio==2.6.0 \
+    demucs==4.0.1 \
+    soundfile \
+    transliteration"
+  );
 });
-
-app.listen(8001, () => console.log("Server running on port 8001"));
